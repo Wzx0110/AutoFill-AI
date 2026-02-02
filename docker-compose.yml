@@ -1,0 +1,18 @@
+services:
+  # 向量資料庫服務
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: autofill-qdrant
+    ports:
+      - "6333:6333"  
+    volumes:
+      - ./qdrant_storage:/qdrant/storage:z
+    restart: always
+
+  # 後端服務 
+  # backend:
+  #   build: ./backend
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on:
+  #     - qdrant

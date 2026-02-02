@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+# AI 相關
+langchain
+langchain-community
+langchain-google-genai
+qdrant-client
+llama-index
+llama-parse

@@ -1,0 +1,14 @@
+# --- Python / Backend ---
+backend/__pycache__/
+backend/venv/
+backend/.env
+*.pyc
+
+# --- Data / DB ---
+qdrant_storage/
+data/
+
+# --- System ---
+.DS_Store
+.vscode/
+.idea/
