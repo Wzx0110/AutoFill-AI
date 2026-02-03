@@ -9,7 +9,7 @@ class LLMService:
         # 初始化模型
         try:
             self.llm = ChatGoogleGenerativeAI(
-                model="gemini-3-flash-preview",
+                model=settings.LLM_MODEL,
                 google_api_key=settings.GOOGLE_API_KEY,
                 temperature=0.3, 
                 convert_system_message_to_human=True

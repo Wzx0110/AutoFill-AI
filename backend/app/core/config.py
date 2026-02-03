@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     GOOGLE_API_KEY: str
     LLAMA_CLOUD_API_KEY: str 
     QDRANT_URL: str = "http://localhost:6333"
+    
+    # 定義模型名稱
+    LLM_MODEL: str = "gemini-3-flash-preview" 
+    # Embedding 模型 
+    EMBEDDING_MODEL: str = "models/text-embedding-004"
 
     class Config:
         env_file = ".env"
