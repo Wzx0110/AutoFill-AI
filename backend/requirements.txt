@@ -1,10 +1,10 @@
 fastapi
 uvicorn[standard]
 python-dotenv
+python-multipart
 # AI 相關
 langchain
-langchain-community
+langchain-qdrant
 langchain-google-genai
 qdrant-client
-llama-index
-llama-parse
+llama-cloud-services
