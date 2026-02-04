@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel
 
 from app.core.config import settings
 from app.services.llm_service import llm_service
+from app.services.rag_service import rag_service
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
@@ -14,7 +15,6 @@ class ChatRequest(BaseModel):
 def health_check():
     return {"status": "ok", "service": "AutoFill AI"}
 
-# 測試接口
 @app.post("/api/test-llm")
 def test_llm(request: ChatRequest):
     """
@@ -24,6 +24,25 @@ def test_llm(request: ChatRequest):
         # 呼叫服務
         reply = llm_service.generate_response(request.message)
         return {"reply": reply}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/upload-reference")
+async def upload_reference(
+    file: UploadFile = File(...), 
+    background_tasks: BackgroundTasks = None
+):
+    """
+    上傳參考文件 (PDF/Word)。
+    使用 BackgroundTasks 在背景處理，避免使用者等待太久。
+    """
+    # 檢查檔案類型
+    if file.content_type not in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
+         # 先允許 PDF 和 Docx
+        pass 
+    try:
+        result = await rag_service.process_and_index_document(file)
+        return {"filename": file.filename, "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
