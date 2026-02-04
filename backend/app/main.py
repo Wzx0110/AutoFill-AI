@@ -10,6 +10,10 @@ app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 # 定義 Request Schema
 class ChatRequest(BaseModel):
     message: str
+    
+class QueryRequest(BaseModel):
+    question: str
+    collection_name: str = "reference_docs" # 預設 collection
 
 @app.get("/")
 def health_check():
@@ -43,6 +47,17 @@ async def upload_reference(
     try:
         result = await rag_service.process_and_index_document(file)
         return {"filename": file.filename, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/query")
+async def query_knowledge_base(request: QueryRequest):
+    """
+    RAG 問答接口：根據已上傳的文件回答問題
+    """
+    try:
+        result = await rag_service.query_document(request.question, request.collection_name)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
