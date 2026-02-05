@@ -1,3 +1,9 @@
+# --- Python / Frontend ---
+frontend/__pycache__/
+frontend/venv/
+frontend/.env
+*.pyc
+
 # --- Python / Backend ---
 backend/__pycache__/
 backend/venv/
