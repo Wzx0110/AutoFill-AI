@@ -6,13 +6,16 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000/api")
 
 class APIClient:
     @staticmethod
-    def upload_reference(file_obj):
+    def upload_reference(file_objs):
         """
-        呼叫後端上傳 PDF
+        支援多檔上傳
+        file_objs: List of files
         """
         try:
-            files = {"file": (file_obj.name, file_obj, "application/pdf")}
-            response = requests.post(f"{BACKEND_URL}/upload-reference", files=files)
+            files_payload = [
+                ("files", (file.name, file, "application/pdf")) for file in file_objs
+            ]
+            response = requests.post(f"{BACKEND_URL}/upload-reference", files=files_payload)
             response.raise_for_status() 
             return response.json()
         except requests.exceptions.RequestException as e:

@@ -39,22 +39,26 @@ with st.sidebar:
     st.markdown("### Knowledge Base")
     st.caption("Upload reference documents to provide context.")
     
-    uploaded_file = st.file_uploader("Select PDF Document", type=["pdf"], label_visibility="collapsed")
+    uploaded_files = st.file_uploader(
+        "Select PDF Document(s)", 
+        type=["pdf"], 
+        accept_multiple_files=True, # 開啟多檔
+        label_visibility="collapsed"
+    )
     
-    if uploaded_file:
+    if uploaded_files:
         if st.button("Process Document", type="primary"):
             # 顯示進度
             with st.status("Processing document...", expanded=True) as status:
                 st.write("Uploading to server...")
-                result = api_client.upload_reference(uploaded_file)
+                result = api_client.upload_reference(uploaded_files)
                 
                 if "error" in result:
                     status.update(label="Process Failed", state="error", expanded=True)
                     st.error(result['error'])
                 else:
-                    chunks = result.get('result', {}).get('chunks', 0)
-                    st.write("Indexing content...")
-                    st.write(f"Vectorizing {chunks} data chunks...")
+                    count = result.get('uploaded_count', 0)
+                    st.write(f"Successfully processed {count} files!")
                     status.update(label="System Ready", state="complete", expanded=False)
                     st.session_state.upload_status = "ready"
     
