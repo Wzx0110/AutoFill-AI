@@ -5,6 +5,8 @@ from typing import List
 from app.core.config import settings
 from app.services.llm_service import llm_service
 from app.services.rag_service import rag_service
+from app.schemas.extraction import ExtractionRequest, ExtractionResponse
+from app.services.extraction_service import extraction_service
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
@@ -62,6 +64,17 @@ async def query_knowledge_base(request: QueryRequest):
     try:
         result = await rag_service.query_document(request.question, request.collection_name)
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/extract", response_model=ExtractionResponse)
+async def extract_form_data(request: ExtractionRequest):
+    """
+    自動填表 API: 接收欄位定義，回傳填完值的 JSON
+    """
+    try:
+        results = await extraction_service.extract_fields(request.fields, request.collection_name)
+        return ExtractionResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

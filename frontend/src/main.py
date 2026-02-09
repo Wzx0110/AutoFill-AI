@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from api_client import api_client
 
 # 頁面全域設定 
@@ -33,89 +34,172 @@ if "messages" not in st.session_state:
     
 if "upload_status" not in st.session_state:
     st.session_state.upload_status = None
+    
+if "extraction_results" not in st.session_state:
+    st.session_state.extraction_results = None
 
 # --- Sidebar: 文件上傳區 ---
 with st.sidebar:
-    st.markdown("### Knowledge Base")
-    st.caption("Upload reference documents to provide context.")
+    st.title("AutoFill AI")
     
+    # === 功能切換 ===
+    mode = st.selectbox("Select Mode", ["Chat Assistant", "Auto-Fill Extraction"])
+    st.divider()
+
+    # === 檔案上傳區 ===
+    st.markdown("### Knowledge Base")
     uploaded_files = st.file_uploader(
-        "Select PDF Document(s)", 
+        "Upload PDF(s)", 
         type=["pdf"], 
-        accept_multiple_files=True, # 開啟多檔
+        accept_multiple_files=True,
         label_visibility="collapsed"
     )
     
     if uploaded_files:
-        if st.button("Process Document", type="primary"):
-            # 顯示進度
-            with st.status("Processing document...", expanded=True) as status:
+        if st.button("Process Document(s)", type="primary"):
+            with st.status("Processing...", expanded=True) as status:
                 st.write("Uploading to server...")
                 result = api_client.upload_reference(uploaded_files)
                 
                 if "error" in result:
-                    status.update(label="Process Failed", state="error", expanded=True)
+                    status.update(label="Failed", state="error")
                     st.error(result['error'])
                 else:
                     count = result.get('uploaded_count', 0)
-                    st.write(f"Successfully processed {count} files!")
+                    st.write(f"Indexed {count} files successfully!")
                     status.update(label="System Ready", state="complete", expanded=False)
                     st.session_state.upload_status = "ready"
     
     st.markdown("---")
-    st.markdown("### System Status")
     if st.session_state.get("upload_status") == "ready":
-        st.success("Index Active")
+        st.success("System Online")
     else:
         st.warning("Waiting for Data")
 
-# --- Main Area: 聊天問答區 ---
+
+# --- 主畫面 ---
 st.markdown("## AutoFill AI Workspace")
-
-# 使用容器來區隔聊天區
-chat_container = st.container()
-
-# 顯示歷史訊息
-with chat_container:
-    for message in st.session_state.messages:
-        role = message["role"]
-        content = message["content"]
-        
-        with st.chat_message(role, avatar=None):
-            st.markdown(content)
-
-# 輸入區 (Input Area)
-if prompt := st.chat_input("Ask a question about the document..."):
-    # 顯示使用者輸入
-    st.session_state.messages.append({"role": "user", "content": prompt})
+# === 聊天室 ===
+if mode == "Chat Assistant":
+    st.markdown("## Chat Workspace")
+    
+    chat_container = st.container()
+    
+    # 顯示歷史訊息
     with chat_container:
-        with st.chat_message("user", avatar=None):
-            st.markdown(prompt)
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"], avatar=None):
+                st.markdown(message["content"])
 
-    # 呼叫 AI (如果沒有上傳文件，給予提示)
-    if st.session_state.get("upload_status") != "ready":
-        response_text = "Please upload and process a document in the sidebar first."
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
+    # 輸入框
+    if prompt := st.chat_input("Ask a question about the document..."):
+        # 顯示使用者輸入
+        st.session_state.messages.append({"role": "user", "content": prompt})
         with chat_container:
-            with st.chat_message("assistant", avatar=None):
-                st.markdown(response_text)
-    else:
-        with chat_container:
-            with st.chat_message("assistant", avatar=None):
-                message_placeholder = st.empty()
-                message_placeholder.markdown("...") # 等待符號
+            with st.chat_message("user", avatar=None):
+                st.markdown(prompt)
                 
-                response = api_client.query_knowledge(prompt)
-                
-                if "error" in response:
-                    full_response = f"System Error: {response['error']}"
-                else:
-                    answer = response.get("answer", "")
-                    sources = list(set(response.get("source_documents", [])))
+        # 呼叫 AI 
+        if st.session_state.get("upload_status") != "ready":
+            err_msg = "Please upload and process a document in the sidebar first."
+            st.session_state.messages.append({"role": "assistant", "content": err_msg})
+            with chat_container:
+                with st.chat_message("assistant", avatar=None):
+                    st.error(err_msg)
+        else:
+            with chat_container:
+                with st.chat_message("assistant", avatar=None):
+                    message_placeholder = st.empty()
+                    message_placeholder.markdown("Thinking...")
                     
-                    # 來源顯示
-                    source_text = f"\n\n<small style='color:grey'>Source: {', '.join(sources)}</small>" if sources else ""
-                    full_response = answer + source_text
+                    response = api_client.query_knowledge(prompt)
+                    
+                    if "error" in response:
+                        full_res = f"System Error: {response['error']}"
+                    else:
+                        answer = response.get("answer", "")
+                        sources = list(set(response.get("source_documents", [])))
+                        source_text = f"\n\n<small style='color:grey'>Ref: {', '.join(sources)}</small>" if sources else ""
+                        full_res = answer + source_text
 
-                message_placeholder.markdown(full_response, unsafe_allow_html=True)
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    message_placeholder.markdown(full_res, unsafe_allow_html=True)
+                    st.session_state.messages.append({"role": "assistant", "content": full_res})
+
+# === 自動填表 ===
+elif mode == "Auto-Fill Extraction":
+    st.markdown("## Auto-Fill Engine")
+    st.markdown("Define the fields you want to extract, and AI will do the rest.")
+
+    col1, col2 = st.columns([1, 1])
+
+    # 左側：定義 Schema
+    with col1:
+        st.subheader("1. Define Extraction Schema")
+        
+        # 預設資料
+        default_data = pd.DataFrame(
+            [
+                {"key": "summary", "description": "文件的主要重點摘要"},
+                {"key": "total_amount", "description": "文件中提到的總金額或費用"},
+                {"key": "date", "description": "文件中的日期或截止日"},
+            ]
+        )
+
+        edited_df = st.data_editor(
+            default_data,
+            num_rows="dynamic", # 允許動態增刪
+            width='stretch',
+            column_config={
+                "key": st.column_config.TextColumn("Field Key (e.g. name)", required=True),
+                "description": st.column_config.TextColumn("Description (AI Prompt)", required=True),
+            },
+            hide_index=True
+        )
+
+        if st.button("Run Extraction", type="primary"):
+            if st.session_state.get("upload_status") != "ready":
+                st.error("Please upload a document in the sidebar first!")
+            else:
+                with st.spinner("AI is reading and extracting data..."):
+                    fields_payload = edited_df.to_dict(orient="records")
+                    for f in fields_payload:
+                        f["data_type"] = "string"
+                    
+                    result = api_client.extract_data(fields_payload)
+                    
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.session_state.extraction_results = result.get("results", [])
+                        st.success("Extraction Complete!")
+
+    # 右側：顯示結果
+    with col2:
+        st.subheader("2. Extraction Results")
+        
+        results = st.session_state.extraction_results
+        
+        if results:
+            res_df = pd.DataFrame(results)
+            display_df = res_df[["key", "value", "confidence", "source"]]
+            
+            st.dataframe(
+                display_df, 
+                width='stretch',
+                column_config={
+                    "key": "Field",
+                    "value": "Extracted Value",
+                    "confidence": "Confidence",
+                    "source": "Source Doc"
+                }
+            )
+            
+            # 提供 JSON 下載
+            st.download_button(
+                label="Download JSON",
+                data=res_df.to_json(orient="records", indent=2, force_ascii=False),
+                file_name="extracted_data.json",
+                mime="application/json"
+            )
+        else:
+            st.info("No results yet. Define schema and click Run.")

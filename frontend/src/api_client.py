@@ -33,5 +33,23 @@ class APIClient:
             return response.json()
         except requests.exceptions.RequestException as e:
             return {"error": str(e)}
+        
+    @staticmethod
+    def extract_data(fields: list):
+        """
+        呼叫後端 Auto-Fill API
+        fields: List[Dict], e.g., [{"key": "name", "description": "...", "data_type": "string"}]
+        """
+        try:
+            payload = {
+                "collection_name": "reference_docs",
+                "fields": fields
+            }
+            
+            response = requests.post(f"{BACKEND_URL}/extract", json=payload)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
 
 api_client = APIClient()
