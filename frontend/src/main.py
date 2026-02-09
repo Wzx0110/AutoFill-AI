@@ -128,51 +128,70 @@ if mode == "Chat Assistant":
 # === 自動填表 ===
 elif mode == "Auto-Fill Extraction":
     st.markdown("## Auto-Fill Engine")
-    st.markdown("Define the fields you want to extract, and AI will do the rest.")
-
+    
     col1, col2 = st.columns([1, 1])
 
     # 左側：定義 Schema
     with col1:
-        st.subheader("1. Define Extraction Schema")
+        st.subheader("1. Target Form & Schema")
         
-        # 預設資料
-        default_data = pd.DataFrame(
-            [
-                {"key": "summary", "description": "文件的主要重點摘要"},
-                {"key": "total_amount", "description": "文件中提到的總金額或費用"},
-                {"key": "date", "description": "文件中的日期或截止日"},
-            ]
-        )
+        # === 目標表單上傳區 ===
+        st.info("Step A: 上傳你要填寫的「空白表格」(PDF/Word)")
+        target_form = st.file_uploader("Upload Target Form", type=["pdf", "docx"], key="target_form")
+        
+        # 初始化 Session 中的欄位資料
+        if "schema_df" not in st.session_state:
+            # 預設範例
+            st.session_state.schema_df = pd.DataFrame([
+                {"key": "example_field", "description": "Example description...", "data_type": "string"}
+            ])
 
+        if target_form:
+            if st.button("AI Analyze Form Structure", type="secondary"):
+                with st.spinner("AI is reading the form structure..."):
+                    res = api_client.analyze_form(target_form)
+                    if "error" in res:
+                        st.error(res["error"])
+                    else:
+                        fields = res.get("fields", [])
+                        if fields:
+                            st.session_state.schema_df = pd.DataFrame(fields)
+                            st.success(f"Detected {len(fields)} fields!")
+                        else:
+                            st.warning("Could not detect any fields.")
+
+        st.markdown("---")
+        st.markdown("Step B: 確認或修改 AI 抓到的欄位")
+        
+        # 讓使用者編輯 AI 分析出來的結果
         edited_df = st.data_editor(
-            default_data,
-            num_rows="dynamic", # 允許動態增刪
+            st.session_state.schema_df, 
+            num_rows="dynamic",
             width='stretch',
             column_config={
-                "key": st.column_config.TextColumn("Field Key (e.g. name)", required=True),
-                "description": st.column_config.TextColumn("Description (AI Prompt)", required=True),
+                "key": st.column_config.TextColumn("Field Key", required=True),
+                "description": st.column_config.TextColumn("Question for AI", required=True),
             },
-            hide_index=True
+            hide_index=True,
+            key="schema_editor" # 加上 key 避免重繪問題
         )
 
-        if st.button("Run Extraction", type="primary"):
-            if st.session_state.get("upload_status") != "ready":
-                st.error("Please upload a document in the sidebar first!")
-            else:
-                with st.spinner("AI is reading and extracting data..."):
+        st.markdown("---")
+        st.markdown("Step C: 執行填寫")
+        if st.button("Run Extraction (RAG + Web)", type="primary"):
+             if st.session_state.get("upload_status") != "ready":
+                st.error("Please upload Reference Documents in the sidebar first!")
+             else:
+                with st.spinner("AI is finding answers (checking docs & web)..."):
                     fields_payload = edited_df.to_dict(orient="records")
-                    for f in fields_payload:
-                        f["data_type"] = "string"
-                    
                     result = api_client.extract_data(fields_payload)
-                    
+                    # ... 處理結果顯示 ...
                     if "error" in result:
                         st.error(result["error"])
                     else:
                         st.session_state.extraction_results = result.get("results", [])
-                        st.success("Extraction Complete!")
-
+                        st.success("Done!")
+    
     # 右側：顯示結果
     with col2:
         st.subheader("2. Extraction Results")

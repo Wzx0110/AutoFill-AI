@@ -7,6 +7,7 @@ from app.services.llm_service import llm_service
 from app.services.rag_service import rag_service
 from app.schemas.extraction import ExtractionRequest, ExtractionResponse
 from app.services.extraction_service import extraction_service
+from app.services.schema_service import schema_service
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
@@ -77,6 +78,18 @@ async def extract_form_data(request: ExtractionRequest):
         return ExtractionResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/analyze-form")
+async def analyze_form_structure(file: UploadFile = File(...)):
+    """
+    上傳空白表格，回傳 AI 分析出的欄位定義 (JSON Schema)
+    """
+    try:
+        fields = await schema_service.analyze_form(file)
+        return {"fields": fields}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn

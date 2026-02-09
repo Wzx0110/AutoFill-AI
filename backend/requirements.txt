@@ -6,5 +6,7 @@ python-multipart
 langchain
 langchain-qdrant
 langchain-google-genai
+langchain-community
 qdrant-client
 llama-cloud-services
+ddgs

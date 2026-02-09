@@ -51,5 +51,15 @@ class APIClient:
             return response.json()
         except requests.exceptions.RequestException as e:
             return {"error": str(e)}
+        
+    @staticmethod
+    def analyze_form(file_obj):
+        try:
+            files = {"file": (file_obj.name, file_obj, "application/pdf")} # 或 word
+            response = requests.post(f"{BACKEND_URL}/analyze-form", files=files)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
 
 api_client = APIClient()
