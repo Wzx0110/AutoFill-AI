@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import uuid
 from api_client import api_client
 
 # 頁面全域設定 
@@ -28,6 +29,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# === Session ID 管理  ===
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4()) # 初始化一個 UUID
+    st.session_state.messages = []
+    st.session_state.upload_status = None
+
 # 初始化 Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -41,6 +48,17 @@ if "extraction_results" not in st.session_state:
 # --- Sidebar: 文件上傳區 ---
 with st.sidebar:
     st.title("AutoFill AI")
+    
+    # 顯示當前 Session ID (除錯用，也可以隱藏)
+    st.caption(f"Session: {st.session_state.session_id[-8:]}...")
+    
+    if st.button("New Chat / Clear Memory", type="secondary"):
+        # 重置所有狀態
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.session_state.upload_status = None
+        st.session_state.extraction_results = None
+        st.rerun() # 重新整理頁面
     
     # === 功能切換 ===
     mode = st.selectbox("Select Mode", ["Chat Assistant", "Auto-Fill Extraction"])
@@ -59,7 +77,7 @@ with st.sidebar:
         if st.button("Process Document(s)", type="primary"):
             with st.status("Processing...", expanded=True) as status:
                 st.write("Uploading to server...")
-                result = api_client.upload_reference(uploaded_files)
+                result = api_client.upload_reference(uploaded_files, st.session_state.session_id)
                 
                 if "error" in result:
                     status.update(label="Failed", state="error")
@@ -99,31 +117,29 @@ if mode == "Chat Assistant":
             with st.chat_message("user", avatar=None):
                 st.markdown(prompt)
                 
-        # 呼叫 AI 
-        if st.session_state.get("upload_status") != "ready":
-            err_msg = "Please upload and process a document in the sidebar first."
-            st.session_state.messages.append({"role": "assistant", "content": err_msg})
-            with chat_container:
-                with st.chat_message("assistant", avatar=None):
-                    st.error(err_msg)
-        else:
-            with chat_container:
-                with st.chat_message("assistant", avatar=None):
-                    message_placeholder = st.empty()
-                    message_placeholder.markdown("Thinking...")
+        # 直接呼叫 API，後端會自己判斷是有文件還是沒文件
+        with chat_container:
+            with st.chat_message("assistant", avatar=None):
+                message_placeholder = st.empty()
+                message_placeholder.markdown("Thinking...")
                     
-                    response = api_client.query_knowledge(prompt)
+                response = api_client.query_knowledge(prompt, st.session_state.session_id)
                     
-                    if "error" in response:
-                        full_res = f"System Error: {response['error']}"
+                if "error" in response:
+                    full_res = f"System Error: {response['error']}"
+                else:
+                    ans = response.get("answer", "")
+                    src = list(set(response.get("source_documents", [])))
+                    # 根據有沒有來源，顯示不同的小字
+                    if src:
+                        src_text = f"\n\n<small style='color:grey'>Ref: {', '.join(src)}</small>"
                     else:
-                        answer = response.get("answer", "")
-                        sources = list(set(response.get("source_documents", [])))
-                        source_text = f"\n\n<small style='color:grey'>Ref: {', '.join(sources)}</small>" if sources else ""
-                        full_res = answer + source_text
+                        src_text = f"\n\n<small style='color:grey'>(General Knowledge)</small>"
+                        
+                full_res = ans + src_text
 
-                    message_placeholder.markdown(full_res, unsafe_allow_html=True)
-                    st.session_state.messages.append({"role": "assistant", "content": full_res})
+                message_placeholder.markdown(full_res, unsafe_allow_html=True)
+                st.session_state.messages.append({"role": "assistant", "content": full_res})
 
 # === 自動填表 ===
 elif mode == "Auto-Fill Extraction":
@@ -181,18 +197,21 @@ elif mode == "Auto-Fill Extraction":
         st.markdown("---")
         st.markdown("Step C: 執行填寫")
         if st.button("Run Extraction (RAG + Web)", type="primary"):
-             if st.session_state.get("upload_status") != "ready":
-                st.error("Please upload Reference Documents in the sidebar first!")
-             else:
-                with st.spinner("AI is finding answers (checking docs & web)..."):
-                    fields_payload = edited_df.to_dict(orient="records")
-                    result = api_client.extract_data(fields_payload)
-                    # ... 處理結果顯示 ...
-                    if "error" in result:
-                        st.error(result["error"])
-                    else:
-                        st.session_state.extraction_results = result.get("results", [])
-                        st.success("Done!")
+             # 直接執行
+            with st.spinner("AI is finding answers (Checking Docs -> Web)..."):
+                fields_payload = edited_df.to_dict(orient="records")
+                # 記得補上 data_type
+                for f in fields_payload:
+                     if "data_type" not in f: f["data_type"] = "string"
+
+                # 呼叫後端 (傳入 session_id)
+                result = api_client.extract_data(fields_payload, st.session_state.session_id)
+                
+                if "error" in result:
+                    st.error(result["error"])
+                else:
+                    st.session_state.extraction_results = result.get("results", [])
+                    st.success("Extraction Complete!")
     
     # 右側：顯示結果
     with col2:

@@ -20,7 +20,7 @@ class ChatRequest(BaseModel):
     
 class QueryRequest(BaseModel):
     question: str
-    collection_name: str = "reference_docs" # 預設 collection
+    session_id: str
 
 @app.get("/")
 def health_check():
@@ -41,6 +41,7 @@ def test_llm(request: ChatRequest):
 @app.post("/api/upload-reference")
 async def upload_reference(
     files: List[UploadFile] = File(...), 
+    session_id: str = Form(...),
     background_tasks: BackgroundTasks = None
 ):
     """
@@ -54,7 +55,7 @@ async def upload_reference(
     try:
         results = []
         for file in files:
-            res = await rag_service.process_and_index_document(file)
+            res = await rag_service.process_and_index_document(file, session_id)
             results.append({"filename": file.filename, "status": "success", "chunks": res["chunks"]})
         return {"uploaded_count": len(results), "details": results}
     except Exception as e:
@@ -66,7 +67,7 @@ async def query_knowledge_base(request: QueryRequest):
     RAG 問答接口：根據已上傳的文件回答問題
     """
     try:
-        result = await rag_service.query_document(request.question, request.collection_name)
+        return await rag_service.query_document(request.question, request.session_id)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -77,7 +78,7 @@ async def extract_form_data(request: ExtractionRequest):
     自動填表 API: 接收欄位定義，回傳填完值的 JSON
     """
     try:
-        results = await extraction_service.extract_fields(request.fields, request.collection_name)
+        results = await extraction_service.extract_fields(request.fields, request.session_id)
         return ExtractionResponse(results=results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

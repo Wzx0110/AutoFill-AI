@@ -9,7 +9,7 @@ class ExtractionField(BaseModel):
 
 # 2. 填寫請求 (整個表單)
 class ExtractionRequest(BaseModel):
-    collection_name: str = "reference_docs"
+    session_id: str = Field(..., description="前端生成的 UUID")
     fields: List[ExtractionField]
 
 # 3. 單一欄位的答案 (後端回傳給前端)

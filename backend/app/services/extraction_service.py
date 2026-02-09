@@ -15,7 +15,7 @@ class ExtractionService:
         self.embeddings = rag_service.embeddings
         self.search_tool = DuckDuckGoSearchRun() 
         
-    async def extract_fields(self, fields: List[ExtractionField], collection_name: str) -> List[FieldResult]:
+    async def extract_fields(self, fields: List[ExtractionField], session_id: str) -> List[FieldResult]:
         results = []
         
         for field in fields:
@@ -46,11 +46,11 @@ class ExtractionService:
             # === 階段 1: 內部文件 RAG ===
             try:
                 rag_answer_pack = await rag_service.query_document(
-                    question=query_prompt,
-                    collection_name=collection_name
+                    question=f"{field.description} (If you don't know the specific value, please answer MISSING)",
+                    session_id=session_id
                 )
                 
-                answer = rag_answer_pack["answer"].strip() # 去除前後空白
+                answer = rag_answer_pack["answer"]
                 sources = rag_answer_pack["source_documents"]
                 
                 # 簡單的後處理 (Post-processing)
@@ -64,17 +64,25 @@ class ExtractionService:
 
                 # 判斷是否需要聯網
                 # 如果回答包含 "MISSING" 或 "未提及" 或來源是空的
-                needs_web_search = "MISSING" in answer or not sources
+                # 關鍵修改：判斷是否需要聯網
+                # 條件 1: 答案包含 "MISSING" (LLM 承認不知道)
+                # 條件 2: 答案包含 "未提及"
+                # 條件 3: 完全沒有來源文件 (表示是純 LLM 瞎猜，對於精確填表來說不可靠，除非是常識題)
+                # 但如果是「填表」，通常我們不希望它用通用知識瞎掰數據，所以 "not sources" 應該觸發聯網
+                
+                needs_web_search = "MISSING" in answer or "未提及" in answer or not sources
+                
+                # 特例：如果欄位是 Date/Boolean 這種通用問題，純 LLM 可能答對，但在填表場景下
+                # 我們假設使用者通常是問「這家公司的營收」，所以沒文件通常就該去搜尋。
                 
                 if not needs_web_search:
-                    # RAG 成功
                     results.append(FieldResult(
                         key=field.key, value=answer, source=str(sources), confidence="High (Doc)"
                     ))
-                    continue # 跳過網路搜尋，處理下一個欄位
+                    continue 
 
             except Exception as e:
-                logger.warning(f"RAG failed for {field.key}, trying web search...")
+                logger.warning(f"RAG/LLM failed for {field.key}, trying web search...")
 
             # === 階段 2: 網路搜尋 (Web Search Fallback) ===
             try:

@@ -7,7 +7,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000/api")
 
 class APIClient:
     @staticmethod
-    def upload_reference(file_objs):
+    def upload_reference(file_objs, session_id):
         """
         支援多檔上傳
         file_objs: List of files
@@ -16,19 +16,20 @@ class APIClient:
             files_payload = [
                 ("files", (file.name, file, "application/pdf")) for file in file_objs
             ]
-            response = requests.post(f"{BACKEND_URL}/upload-reference", files=files_payload)
+            data_payload = {"session_id": session_id}
+            response = requests.post(f"{BACKEND_URL}/upload-reference", files=files_payload, data=data_payload)
             response.raise_for_status() 
             return response.json()
         except requests.exceptions.RequestException as e:
             return {"error": str(e)}
 
     @staticmethod
-    def query_knowledge(question: str):
+    def query_knowledge(question: str, session_id: str):
         """
         呼叫後端進行 RAG 問答
         """
         try:
-            payload = {"question": question}
+            payload = {"question": question, "session_id": session_id}
             response = requests.post(f"{BACKEND_URL}/query", json=payload)
             response.raise_for_status()
             return response.json()
@@ -36,14 +37,14 @@ class APIClient:
             return {"error": str(e)}
         
     @staticmethod
-    def extract_data(fields: list):
+    def extract_data(fields: list, session_id: str):
         """
         呼叫後端 Auto-Fill API
         fields: List[Dict], e.g., [{"key": "name", "description": "...", "data_type": "string"}]
         """
         try:
             payload = {
-                "collection_name": "reference_docs",
+                "session_id": session_id,
                 "fields": fields
             }
             
