@@ -10,3 +10,6 @@ langchain-community
 qdrant-client
 llama-cloud-services
 ddgs
+# File
+pdfrw
+python-docx

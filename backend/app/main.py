@@ -1,13 +1,16 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Form
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List
+import json
 
 from app.core.config import settings
 from app.services.llm_service import llm_service
 from app.services.rag_service import rag_service
-from app.schemas.extraction import ExtractionRequest, ExtractionResponse
+from app.schemas.extraction import ExtractionRequest, ExtractionResponse, FieldResult
 from app.services.extraction_service import extraction_service
 from app.services.schema_service import schema_service
+from app.services.file_filler_service import file_filler_service
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
@@ -87,6 +90,30 @@ async def analyze_form_structure(file: UploadFile = File(...)):
     try:
         fields = await schema_service.analyze_form(file)
         return {"fields": fields}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/generate-file")
+async def generate_filled_file(
+    file: UploadFile = File(...), 
+    results_json: str = Form(...) # 因為要同時傳檔案和 JSON，這裡用 Form 接收 JSON String
+):
+    """
+    接收原本的空白表格 + 提取出的結果 JSON -> 回傳填寫好的檔案
+    """
+    try:
+        # 解析 JSON 字串回 List[FieldResult]
+        results_data = json.loads(results_json)
+        results_objects = [FieldResult(**item) for item in results_data]
+        
+        output_path = file_filler_service.fill_document(file, results_objects)
+        
+        # 回傳檔案
+        return FileResponse(
+            output_path, 
+            filename=f"filled_{file.filename}",
+            media_type="application/octet-stream"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -138,6 +138,8 @@ elif mode == "Auto-Fill Extraction":
         # === 目標表單上傳區 ===
         st.info("Step A: 上傳你要填寫的「空白表格」(PDF/Word)")
         target_form = st.file_uploader("Upload Target Form", type=["pdf", "docx"], key="target_form")
+        if target_form:
+            st.session_state["uploaded_target_form_obj"] = target_form # 把物件存起來
         
         # 初始化 Session 中的欄位資料
         if "schema_df" not in st.session_state:
@@ -222,3 +224,37 @@ elif mode == "Auto-Fill Extraction":
             )
         else:
             st.info("No results yet. Define schema and click Run.")
+    
+    st.markdown("---")
+    st.subheader("3. Download Filled Document")
+    
+    # 取得當前上傳的 Target Form
+    target_form = st.session_state.get("uploaded_target_form_obj") # 這裡你要在上面 upload 時存起來
+    
+    # *注意*: Streamlit 的 file_uploader 物件如果頁面重整會消失
+    # 為了簡化，我們這裡假設使用者還沒重新整理
+    
+    if st.button("Generate Filled File"):
+        # 這裡需要一個小技巧：因為 target_form 是一個 Streamlit UploadedFile 物件
+        # 我們需要確保它是可讀的
+        if target_form:
+            target_form.seek(0) # 重置游標
+            
+            with st.spinner("Generating document..."):
+                file_content = api_client.generate_filled_file(
+                    target_form, 
+                    st.session_state.extraction_results
+                )
+                
+                if isinstance(file_content, dict) and "error" in file_content:
+                    st.error(file_content["error"])
+                else:
+                    # 提供下載按鈕
+                    st.download_button(
+                        label="Click to Download",
+                        data=file_content,
+                        file_name=f"filled_{target_form.name}",
+                        mime="application/octet-stream"
+                    )
+        else:
+            st.warning("Target form session expired. Please upload the form again.")

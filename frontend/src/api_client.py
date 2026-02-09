@@ -1,5 +1,6 @@
 import requests
 import os
+import json
 
 # 後端網址 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000/api")
@@ -60,6 +61,22 @@ class APIClient:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
+        
+    @staticmethod
+    def generate_filled_file(file_obj, results_list):
+        try:
+            # 準備 multipart/form-data
+            files = {"file": (file_obj.name, file_obj, file_obj.type)}
+            data = {"results_json": json.dumps(results_list)}
+            
+            response = requests.post(f"{BACKEND_URL}/generate-file", files=files, data=data)
+            
+            if response.status_code == 200:
+                return response.content # 回傳二進制檔案內容
+            else:
+                return {"error": f"Failed: {response.text}"}
+        except Exception as e:
             return {"error": str(e)}
 
 api_client = APIClient()
