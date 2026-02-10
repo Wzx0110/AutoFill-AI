@@ -7,9 +7,10 @@ langchain
 langchain-qdrant
 langchain-google-genai
 langchain-community
+langchain-classic
 qdrant-client
 llama-cloud-services
-ddgs
+ddgs # duckduckgo-search
 # File
 pdfrw
 python-docx
