@@ -124,11 +124,15 @@ if mode == "Chat Assistant":
                 message_placeholder.markdown("Thinking...")
                     
                 response = api_client.query_knowledge(prompt, st.session_state.session_id)
-                    
                 if "error" in response:
-                    full_res = f"System Error: {response['error']}"
+                        full_res = f"Error: {response['error']}"
                 else:
                     ans = response.get("answer", "")
+                    if isinstance(ans, list):
+                        # 列表接成字串
+                        ans = "".join([str(x) if isinstance(x, str) else str(x.get('text','')) for x in ans])
+                    elif not isinstance(ans, str):
+                        ans = str(ans)
                     src = list(set(response.get("source_documents", [])))
                     # 根據有沒有來源，顯示不同的小字
                     if src:
@@ -136,7 +140,7 @@ if mode == "Chat Assistant":
                     else:
                         src_text = f"\n\n<small style='color:grey'>(General Knowledge)</small>"
                         
-                full_res = ans + src_text
+                    full_res = ans + src_text 
 
                 message_placeholder.markdown(full_res, unsafe_allow_html=True)
                 st.session_state.messages.append({"role": "assistant", "content": full_res})

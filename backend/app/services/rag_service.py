@@ -2,24 +2,23 @@ import os
 import shutil
 import tempfile
 import logging
-from typing import List
+from typing import List, Dict, Any
 
 from fastapi import UploadFile
 from llama_cloud_services import LlamaParse
 
 # LangChain Core
 from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+from langchain.agents import create_agent 
+from langchain_core.messages import SystemMessage
 
 # LangChain Google & Qdrant
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-# Tools & Agent
+
+# Tools
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 
 from app.core.config import settings
 
@@ -28,16 +27,12 @@ logger = logging.getLogger(__name__)
 class RAGService:
     def __init__(self):
         # 初始化 Embeddings
-        try:
-            self.embeddings = GoogleGenerativeAIEmbeddings(
-                model=settings.EMBEDDING_MODEL,
-                google_api_key=settings.GOOGLE_API_KEY
-            )
-        except Exception as e:
-            logger.error(f"Embeddings Init Error: {e}")
-            raise e
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model=settings.EMBEDDING_MODEL,
+            google_api_key=settings.GOOGLE_API_KEY
+        )
 
-        # 初始化 LLM 
+        # 初始化 LLM
         self.llm = ChatGoogleGenerativeAI(
             model=settings.LLM_MODEL,
             google_api_key=settings.GOOGLE_API_KEY,
@@ -48,7 +43,7 @@ class RAGService:
         self.search_tool = DuckDuckGoSearchRun()
         self.tools = [self.search_tool]
 
-        logger.info("Agentic RAG Service initialized.")
+        logger.info("LangChain Agent (LangGraph-based) Service initialized.")
 
     async def process_and_index_document(self, file: UploadFile, session_id: str):
         """
@@ -67,12 +62,11 @@ class RAGService:
             # 使用 LlamaParse 解析
             # 參考: https://developers.llamaindex.ai/python/cloud/llamaparse/
             parser = LlamaParse(
-                api_key=settings.LLAMA_CLOUD_API_KEY,
+                api_key=settings.LLAMA_CLOUD_API_KEY, 
                 result_type="markdown", 
-                verbose=True,
+                verbose=True
             )
             job_result = await parser.aparse(temp_file_path)
-            
             # 將 LlamaIndex 的文件格式轉換為 LangChain 的格式
             langchain_docs = [Document(page_content=page.text, metadata={"source": file.filename}) for page in job_result.pages]
 
@@ -87,13 +81,13 @@ class RAGService:
             )
             return {"status": "success", "chunks": len(langchain_docs), "collection": collection_name}
         except Exception as e:
-            logger.error(f"Error processing document: {e}")
+            logger.error(f"Index Error: {e}")
             raise e
         finally:
-            # 清理暫存檔案 
+            # 清理暫存檔案
             if temp_file_path and os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
-                
+
     async def query_document(self, question: str, session_id: str):
         """
         用戶提問 -> 轉向量 -> 搜尋 Qdrant -> 抓出相關文章 -> 給 LLM 整理回答
@@ -105,97 +99,86 @@ class RAGService:
            - 不足 -> 呼叫 Search Tool -> 整合後回答
         """
         collection_name = f"session_{session_id}"
+        
         try:
-            # 連接 Qdrant (Retriever)
-            # 參考: https://reference.langchain.com/python/integrations/langchain_qdrant/#langchain_qdrant.QdrantVectorStore
             client = QdrantClient(url=settings.QDRANT_URL)
             
-            # 檢查是否有文件 (Retrieval Stage)
-            collections = client.get_collections().collections
-            has_collection = any(c.name == collection_name for c in collections)
-            retrieved_context = ""
+            # 檢索階段 (Retrieval)
+            # 參考: https://reference.langchain.com/python/integrations/langchain_qdrant/#langchain_qdrant.QdrantVectorStore
+            retrieved_context = "No internal documents found."
             sources = []
 
-            if has_collection and client.count(collection_name).count > 0:
+            # 檢查 Collection 是否存在且有資料
+            collections = client.get_collections().collections
+            if any(c.name == collection_name for c in collections) and client.count(collection_name).count > 0:
                 vector_store = QdrantVectorStore(
                     client=client,
                     collection_name=collection_name,
                     embedding=self.embeddings,
                 )
                 retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 3, "fetch_k": 5})
-                
-                # 執行檢索
                 docs = await retriever.ainvoke(question)
-                # 整理檢索到的內容
-                retrieved_context = "\n\n".join([d.page_content for d in docs])
-                sources = [d.metadata.get("source", "unknown") for d in docs]
-            else:
-                retrieved_context = "No internal documents uploaded for this session."
                 
-            # 定義 Agent 的 Prompt 
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", """
-                You are a smart AI assistant named 'AutoFill Agent'.
-                
-                You have access to the following INTERNAL CONTEXT from user uploaded files:
-                <internal_context>
-                {context}
-                </internal_context>
+                if docs:
+                    retrieved_context = "\n\n".join([d.page_content for d in docs])
+                    sources = [d.metadata.get("source", "unknown") for d in docs]
 
-                Your Goal: Answer the user's question accurately.
-                
-                Strategy:
-                1. FIRST, check the <internal_context>. If the answer is there, use it.
-                2. IF (and only if) the internal context is missing information (e.g., about competitors, latest news, or specific facts not in the file), USE YOUR SEARCH TOOL.
-                3. When answering, cite your sources. Say "According to the document..." or "Based on web search...".
-                """),
-                ("human", "{input}"),
-                ("placeholder", "{agent_scratchpad}"), # Agent 思考和呼叫工具的記憶區
-            ])
+            # 定義 System Prompt
+            system_prompt_content = f"""
+            You are a smart 'AutoFill Agent'.
+            
+            === INTERNAL CONTEXT (From uploaded files) ===
+            {retrieved_context}
+            ==============================================
+            
+            CRITICAL INSTRUCTIONS:
+            1. First, check the INTERNAL CONTEXT. If the answer is there, use it.
+            2. If the answer is NOT in the context (e.g., comparing with a competitor not in the file), you MUST use the search tool.
+            3. Do not just say "I don't know". Research it.
+            4. When answering, cite your sources (e.g., "According to the file..." or "Based on web search...").
+            """
 
             # 建立 Agent
-            agent = create_tool_calling_agent(self.llm, self.tools, prompt)
-            
-            # 建立執行器 (AgentExecutor)
-            agent_executor = AgentExecutor(
-                agent=agent, 
-                tools=self.tools, 
-                verbose=True, 
-                handle_parsing_errors=True
+            agent = create_agent(
+                model=self.llm,          
+                tools=self.tools,         
+                system_prompt=system_prompt_content 
             )
 
-            # 執行
-            response = await agent_executor.ainvoke({
-                "input": question,
-                "context": retrieved_context
-            })
-
-            # 回傳結果
-            raw_output = response.get("output", "")
+            # 執行 Agent
+            result = await agent.ainvoke(
+                {"messages": [{"role": "user", "content": question}]}
+            )
+            
+            # 解析結果
+            last_message = result["messages"][-1]
+            raw_content = last_message.content
             final_answer = ""
             
-            # 模型回傳標準字串 (String)
-            if isinstance(raw_output, str):
-                final_answer = raw_output
-            
-            # 模型回傳結構化列表 (List of Dicts) 
-            elif isinstance(raw_output, list):
-                for item in raw_output:
-                    if isinstance(item, dict) and "text" in item:
-                        final_answer += item["text"]
-                    elif isinstance(item, str):
+            # 純字串
+            if isinstance(raw_content, str):
+                final_answer = raw_content  
+            # 列表 
+            elif isinstance(raw_content, list):
+                for item in raw_content:
+                    if isinstance(item, str):
                         final_answer += item
-            
-            # 情況 C: 其他未知格式，轉字串保命
+                    elif isinstance(item, dict) and "text" in item:
+                        final_answer += item["text"]
+            # 其他
             else:
-                final_answer = str(raw_output)
+                final_answer = str(raw_content)
             
             logger.info(f"Agent Final Answer: {final_answer[:100]}...")
 
-            # 用到 search tool，標記 source
-            if "duckduckgo" in str(response).lower() or "search" in final_answer.lower():
-                if "Internet Search" not in sources:
-                    sources.append("Internet Search")
+            # 處理 Sources 標記 (檢查是否使用了工具)
+            for msg in result["messages"]:
+                # 檢查是否有 ToolMessage (代表工具被呼叫並回傳了結果)
+                if msg.type == "tool": 
+                     if "Internet Search" not in sources:
+                        sources.append("Internet Search")
+
+            logger.info(f"Agent Answer: {final_answer[:100]}...")
 
             return {
                 "answer": final_answer,
@@ -203,9 +186,9 @@ class RAGService:
             }
 
         except Exception as e:
-            logger.error(f"Agent Query Error: {e}")
+            logger.error(f"Agent Error: {e}")
             return {
-                "answer": f"I encountered an error while thinking: {str(e)}",
+                "answer": f"Processing Error: {str(e)}",
                 "source_documents": []
             }
 
