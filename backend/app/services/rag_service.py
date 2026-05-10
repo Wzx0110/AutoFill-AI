@@ -15,6 +15,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableConfig
 
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+
 # LangGraph 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -56,10 +59,17 @@ class RAGService:
         self.llm = ChatGoogleGenerativeAI(
             model=settings.LLM_MODEL,
             google_api_key=settings.GOOGLE_API_KEY,
-            temperature=0.2 # 溫度調低，更客觀
+            temperature=0.2 # 溫度調低
         )
         
         self.tavily_client = AsyncTavilyClient(api_key=settings.TAVILY_API_KEY)
+        
+        # 初始化 BGE Reranker 模型
+        logger.info("載入 BGE Reranker 模型")
+        self.cross_encoder_model = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
+        # 設定保留分數最高的 Top 8
+        self.compressor = CrossEncoderReranker(model=self.cross_encoder_model, top_n=8)
+        logger.info("Reranker 模型載入完成！")
         
         # === 建立 LangGraph 狀態機 ===
         self.graph = self._build_graph()
@@ -101,8 +111,18 @@ class RAGService:
         return {"search_query": optimized_query}
     
     async def retrieve_node(self, state: GraphState):
-        """節點：強制查詢本地 Qdrant 向量庫"""
+        """節點：查詢本地 Qdrant 向量庫並 rerank"""
+        
+        # 確保查詢字串絕對乾淨，去除多餘空白與換行
         search_target = state.get("search_query", state["question"])
+        if isinstance(search_target, str):
+            search_target = search_target.strip()
+        
+        # 如果重寫後的字串為空，強制退回使用者的原始提問
+        if not search_target:
+            search_target = state["question"].strip()
+            logger.warning("[Retrieve Node] search_query was empty, fallback to original question.")
+            
         session_id = state["session_id"]
         collection_name = f"session_{session_id}"
         
@@ -112,10 +132,20 @@ class RAGService:
         try:
             client = QdrantClient(url=settings.QDRANT_URL)
             collections = client.get_collections().collections
+            
             if any(c.name == collection_name for c in collections) and client.count(collection_name).count > 0:
                 vector_store = QdrantVectorStore(client=client, collection_name=collection_name, embedding=self.embeddings)
-                retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
-                retrieved_docs = await retriever.ainvoke(search_target) 
+                
+                # First-stage Retrieval -> 撈出 25 筆
+                base_retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 25})
+                
+                # 取得初始文件
+                retrieved_docs = await base_retriever.ainvoke(search_target)
+                
+                # 有找到文件，再手動丟給 Reranker 進行重新評分與篩選 Top 8
+                if retrieved_docs:
+                    # 使用 acompress_documents 確保完全非同步，不卡死主執行緒
+                    retrieved_docs = await self.compressor.acompress_documents(retrieved_docs, search_target)
                 
                 for d in retrieved_docs:
                     source_name = d.metadata.get("source", "unknown")
@@ -126,7 +156,7 @@ class RAGService:
                     })
                     sources.add(source_name)
                     
-            logger.info(f"[Retrieve Node] Found {len(docs)} document chunks.")
+            logger.info(f"[Retrieve Node] Successfully retrieved and reranked {len(docs)} document chunks.")
         except Exception as e:
             logger.warning(f"[Retrieve Node] Error: {e}")
 
@@ -176,7 +206,7 @@ class RAGService:
         documents = state.get("documents", [])
         sources = state.get("sources", set())
 
-        logger.info(f"🌐 [Web Search Node] Searching Tavily for: {search_target}")
+        logger.info(f"[Web Search Node] Searching Tavily for: {search_target}")
         
         try:
             # 呼叫 Tavily API
