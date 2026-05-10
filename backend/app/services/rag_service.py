@@ -25,7 +25,7 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 # Tools
-from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from tavily import AsyncTavilyClient
 
 from app.core.config import settings
 
@@ -59,7 +59,7 @@ class RAGService:
             temperature=0.2 # 溫度調低，更客觀
         )
         
-        self.search_tool = DuckDuckGoSearchAPIWrapper()
+        self.tavily_client = AsyncTavilyClient(api_key=settings.TAVILY_API_KEY)
         
         # === 建立 LangGraph 狀態機 ===
         self.graph = self._build_graph()
@@ -171,34 +171,44 @@ class RAGService:
             return "web_search"
 
     async def web_search_node(self, state: GraphState):
-        """節點：聯網搜尋 (僅在需要時觸發)"""
+        """節點：聯網搜尋 (Tavily AI Search)"""
         search_target = state.get("search_query", state["question"])
         documents = state.get("documents", [])
         sources = state.get("sources", set())
 
-        logger.info(f"[Web Search Node] Searching DuckDuckGo for: {search_target}")
+        logger.info(f"🌐 [Web Search Node] Searching Tavily for: {search_target}")
         
         try:
-            # 使用 .results() 獲取前 3 筆帶有網址的結構化資料
-            search_results = self.search_tool.results(search_target, max_results=8)
+            # 呼叫 Tavily API
+            # search_depth="basic" 速度極快且夠用，"advanced" 則會深入爬取長文
+            response = await self.tavily_client.search(
+                query=search_target,
+                max_results=5,          # 抓取前 5 筆最相關的資料
+                search_depth="basic" 
+            )
+            
+            # Tavily 的結果
+            search_results = response.get("results", [])
             
             if search_results:
                 for res in search_results:
                     title = res.get("title", "Internet Search")
-                    link = res.get("link", "")
-                    snippet = res.get("snippet", "")
+                    link = res.get("url", "")
+                    content = res.get("content", "")
                     
                     documents.append({
                         "source_name": title,
                         "url": link,
-                        "content": snippet
+                        "content": content
                     })
                     sources.add(title)
+                    
+                logger.info(f"[Web Search Node] Successfully retrieved {len(search_results)} results from Tavily.")
             else:
-                logger.warning("[Web Search Node] Empty results.")
+                logger.warning("[Web Search Node] Tavily returned empty results.")
                 
         except Exception as e:
-            logger.error(f"[Web Search Node] Search failed: {e}")
+            logger.error(f"[Web Search Node] Tavily Search failed: {e}")
 
         return {"documents": documents, "sources": sources}
 
