@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # 定義模型名稱
     LLM_MODEL: str = "gemini-3.1-flash-lite" 
     # Embedding 模型 
-    EMBEDDING_MODEL: str = "models/gemini-embedding-001"
+    EMBEDDING_MODEL: str = "models/gemini-embedding-2"
 
     class Config:
         env_file = ".env"
