@@ -25,7 +25,7 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 # Tools
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 
 from app.core.config import settings
 
@@ -40,8 +40,9 @@ logger = logging.getLogger(__name__)
 class GraphState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     question: str
+    search_query: str
     session_id: str
-    documents: List[str]      # 存放找到的文件片段
+    documents: List[dict]      # 存放找到的文件片段
     sources: Set[str]         # 存放資料來源
 
 
@@ -58,7 +59,7 @@ class RAGService:
             temperature=0.2 # 溫度調低，更客觀
         )
         
-        self.search_tool = DuckDuckGoSearchRun()
+        self.search_tool = DuckDuckGoSearchAPIWrapper()
         
         # === 建立 LangGraph 狀態機 ===
         self.graph = self._build_graph()
@@ -68,9 +69,40 @@ class RAGService:
     # 定義各個節點 (Nodes) 邏輯
     # ==========================================
     
+    async def rewrite_node(self, state: GraphState):
+        """節點：查詢重寫 (Query Rewrite)"""
+        original_question = state["question"]
+        
+        logger.info(f"[Rewrite Node] Original Question: {original_question}")
+
+        # 使用 LLM 將使用者的問題轉換為最佳的向量檢索關鍵字
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a Search Query Optimization Expert.
+            Convert the user's conversational question into a CONCISE and highly effective search query.
+            
+            CRITICAL RULES:
+            1. KEEP IT SHORT: Use ideally 3 to 6 words.
+            2. ESSENTIALS ONLY: Extract ONLY the core entities, exact dates, and main metrics.
+            3. NO FILLERS: Do NOT add descriptive filler words or synonyms like "comparison", "analysis", "performance", "what is", or "tell me".
+            4. Translate to English for better search results.
+            
+            Return ONLY the string.
+            """),
+            ("human", "{question}")
+        ])
+
+        # 使用 StrOutputParser 確保只拿回純文字
+        chain = prompt | self.llm | StrOutputParser()
+        optimized_query = await chain.ainvoke({"question": original_question})
+        
+        logger.info(f"[Rewrite Node] Optimized Query: {optimized_query}")
+        
+        # 將重寫後的查詢存入 state
+        return {"search_query": optimized_query}
+    
     async def retrieve_node(self, state: GraphState):
-        """節點 1：強制查詢本地 Qdrant 向量庫"""
-        question = state["question"]
+        """節點：強制查詢本地 Qdrant 向量庫"""
+        search_target = state.get("search_query", state["question"])
         session_id = state["session_id"]
         collection_name = f"session_{session_id}"
         
@@ -82,18 +114,22 @@ class RAGService:
             collections = client.get_collections().collections
             if any(c.name == collection_name for c in collections) and client.count(collection_name).count > 0:
                 vector_store = QdrantVectorStore(client=client, collection_name=collection_name, embedding=self.embeddings)
-                retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 3, "fetch_k": 5})
-                retrieved_docs = await retriever.ainvoke(question)
+                retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 6, "fetch_k": 20})
+                retrieved_docs = await retriever.ainvoke(search_target) 
                 
                 for d in retrieved_docs:
-                    docs.append(d.page_content)
-                    sources.add(d.metadata.get("source", "unknown"))
+                    source_name = d.metadata.get("source", "unknown")
+                    docs.append({
+                        "source_name": source_name,
+                        "url": None,
+                        "content": d.page_content
+                    })
+                    sources.add(source_name)
                     
-            logger.info(f"📄 [Retrieve Node] Found {len(docs)} documents internally.")
+            logger.info(f"[Retrieve Node] Found {len(docs)} document chunks.")
         except Exception as e:
-            logger.warning(f"[Retrieve Node] Error or collection not found: {e}")
+            logger.warning(f"[Retrieve Node] Error: {e}")
 
-        # 將找到的資料更新回 State
         return {"documents": docs, "sources": sources}
 
     async def grade_and_route(self, state: GraphState) -> str:
@@ -107,7 +143,7 @@ class RAGService:
             return "web_search"
 
         # 使用 LLM 來當裁判 (Grader)
-        context = "\n\n".join(documents)
+        context = "\n\n".join([doc["content"] for doc in documents])
         prompt = ChatPromptTemplate.from_template(
             """You are a grader assessing whether the following retrieved context is sufficient to fully answer the user's question.
             
@@ -135,41 +171,86 @@ class RAGService:
             return "web_search"
 
     async def web_search_node(self, state: GraphState):
-        """節點 2：聯網搜尋 (僅在需要時觸發)"""
-        question = state["question"]
+        """節點：聯網搜尋 (僅在需要時觸發)"""
+        search_target = state.get("search_query", state["question"])
         documents = state.get("documents", [])
         sources = state.get("sources", set())
 
-        logger.info(f"[Web Search Node] Searching DuckDuckGo for: {question}")
+        logger.info(f"[Web Search Node] Searching DuckDuckGo for: {search_target}")
         
         try:
-            # 執行搜尋
-            search_result = self.search_tool.invoke(question)
-            documents.append(f"Web Search Results:\n{search_result}")
-            sources.add("Internet Search")
+            # 使用 .results() 獲取前 3 筆帶有網址的結構化資料
+            search_results = self.search_tool.results(search_target, max_results=8)
+            
+            if search_results:
+                for res in search_results:
+                    title = res.get("title", "Internet Search")
+                    link = res.get("link", "")
+                    snippet = res.get("snippet", "")
+                    
+                    documents.append({
+                        "source_name": title,
+                        "url": link,
+                        "content": snippet
+                    })
+                    sources.add(title)
+            else:
+                logger.warning("[Web Search Node] Empty results.")
+                
         except Exception as e:
             logger.error(f"[Web Search Node] Search failed: {e}")
 
         return {"documents": documents, "sources": sources}
 
     async def generate_node(self, state: GraphState, config: RunnableConfig):
-        """節點 3：結合所有收集到的資料，生成最終回答"""
+        """節點：結合所有收集到的資料，生成最終回答"""
         question = state["question"]
         documents = state.get("documents", [])
 
-        context = "\n\n".join(documents) if documents else "No relevant context found."
+        grouped_docs = {}
+        for doc in documents:
+            key = (doc["source_name"], doc["url"])
+            if key not in grouped_docs:
+                grouped_docs[key] = []
+            grouped_docs[key].append(doc["content"])
+
+        context = ""
+        for i, (key, contents) in enumerate(grouped_docs.items(), 1):
+            source_name, url = key
+            context += f"=== Source [{i}] ===\n"
+            context += f"Name: {source_name}\n"
+            if url:
+                context += f"URL: {url}\n"
+            context += "Content:\n" + "\n...\n".join(contents) + "\n\n"
+            
+        if not context:
+            context = "No relevant context found."
         
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a smart 'AutoFill Agent'.
+            ("system", """You are a highly intelligent Information Synthesis Agent.
             
             === GATHERED CONTEXT ===
             {context}
             ========================
             
-            Instructions:
-            1. Answer the user's question accurately using ONLY the gathered context above.
-            2. If the context still does not contain the answer, politely state that you cannot find the information.
-            3. Always cite your sources.
+            CRITICAL INSTRUCTIONS (MUST FOLLOW EXACTLY OR FAIL):
+            1. DIRECT ANSWER: Start IMMEDIATELY with the facts. No filler phrases.
+            2. SEQUENTIAL RENUMBERING (CRITICAL): You MUST renumber the sources you actually cite sequentially, starting from 1 (i.e., 1, 2, 3...). Do NOT skip numbers. Ignore the original Source IDs from the context.
+            3. INLINE CITATIONS (MUST BE CLICKABLE): 
+               - For internet sources, you MUST embed the URL inline using this EXACT format: `[[1](URL)]` (Outer brackets are plain text, the number inside is a clickable link).
+               - For local documents, use plain text: `[1]`
+               - NEVER combine citations. Use `[1][[2](URL)]`, NOT `[1, 2]`.
+            4. SOURCES LIST FORMAT (CRITICAL): At the VERY END, add a blank line, write exactly "**Sources:**" (in bold), and list EACH cited source sequentially.
+               - Use a standard numbered list (`1. `, `2. `, `3. `). Do NOT use bullet points (`-`).
+               - Format for internet sources: `1. [Name](URL)`
+               - Format for local documents: `1. Name`
+               
+               Example Footer:
+               
+               **Sources:**
+               1. NVIDIA_FY25_Q3.pdf
+               2. [AMD Earnings Report](https://example.com)
+               3. [Tech News](https://news.com)
             """),
             ("human", "{question}")
         ])
@@ -191,12 +272,16 @@ class RAGService:
         workflow = StateGraph(GraphState)
 
         # 加入所有節點
+        workflow.add_node("rewrite", self.rewrite_node)
         workflow.add_node("retrieve", self.retrieve_node)
         workflow.add_node("web_search", self.web_search_node)
         workflow.add_node("generate", self.generate_node)
-
-        # 設定流程起點 -> 強制去檢索
-        workflow.add_edge(START, "retrieve")
+        
+        # 設定流程起點 -> 先去重寫問題
+        workflow.add_edge(START, "rewrite")         
+        
+        # 重寫完畢 -> 去檢索
+        workflow.add_edge("rewrite", "retrieve")    
 
         # 設定條件分歧點 -> 檢索完後交給 Grader 決定下一步
         workflow.add_conditional_edges(
@@ -207,10 +292,8 @@ class RAGService:
                 "generate": "generate"      # 如果回傳 generate，直接走向生成
             }
         )
-
-        # 聯網搜尋完畢後 -> 走向生成
+        # 聯網搜尋完畢後 -> 生成
         workflow.add_edge("web_search", "generate")
-        
         # 生成完畢後 -> 結束
         workflow.add_edge("generate", END)
 
@@ -270,9 +353,10 @@ class RAGService:
             
             # 用來在串流過程中收集來源
             collected_sources = set()
+            # 用來收集 LLM 的完整回答
+            full_generated_text = ""
             
             # 使用 config 傳遞串流設定 (給 generate_node 裡的 LLM 用)
-            from langchain_core.runnables import RunnableConfig
             config = RunnableConfig()
 
             async for stream_mode, chunk in self.graph.astream(inputs, stream_mode=["messages", "updates"], config=config):
@@ -305,8 +389,8 @@ class RAGService:
                             if content_str:
                                 yield json.dumps({"type": "token", "content": content_str}) + "\n"
 
-            # 迴圈結束後，直接回傳剛剛收集到的 collected_sources！
-            yield json.dumps({"type": "sources", "content": list(collected_sources)}) + "\n"
+            # LLM 已經把 Reference 寫在 markdown 裡了
+            yield json.dumps({"type": "sources", "content": []}) + "\n"
 
         except Exception as e:
             logger.error(f"Stream Error: {e}", exc_info=True)
