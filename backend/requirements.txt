@@ -10,7 +10,8 @@ langchain-community
 langchain-classic
 qdrant-client
 llama-cloud-services
-ddgs # duckduckgo-search
+tavily-python
+# ddgs # duckduckgo-search
 # File
 pdfrw
 python-docx

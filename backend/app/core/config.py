@@ -8,10 +8,11 @@ class Settings(BaseSettings):
     # 敏感資料 (自動從 .env 讀取)
     GOOGLE_API_KEY: str
     LLAMA_CLOUD_API_KEY: str 
+    TAVILY_API_KEY: str = ""
     QDRANT_URL: str = "http://localhost:6333"
     
     # 定義模型名稱
-    LLM_MODEL: str = "gemini-3-flash-preview" 
+    LLM_MODEL: str = "gemini-3.1-flash-lite" 
     # Embedding 模型 
     EMBEDDING_MODEL: str = "models/gemini-embedding-001"
 
