@@ -2,21 +2,21 @@ import os
 import shutil
 import tempfile
 import logging
+import asyncio
 import json
-from typing import AsyncGenerator, TypedDict, Annotated, List, Set, Sequence
+from typing import AsyncGenerator, TypedDict, Annotated, List, Literal
 
 from fastapi import UploadFile
+from pydantic import BaseModel, Field
 from llama_cloud_services import LlamaParse
 
 # LangChain Core
-from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessageChunk
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableConfig
 
-from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 
 # LangGraph 
 from langgraph.graph import StateGraph, START, END
@@ -24,416 +24,439 @@ from langgraph.graph.message import add_messages
 
 # LangChain Google & Qdrant
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_qdrant import QdrantVectorStore
+from langchain_qdrant import QdrantVectorStore, RetrievalMode, FastEmbedSparse
 from qdrant_client import QdrantClient
 
 # Tools
 from tavily import AsyncTavilyClient
+from app.core.config import settings 
 
-from app.core.config import settings
+# ------------------------------------------
+# Logger Configuration (格式設定)
+# ------------------------------------------
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("AdaptiveRAG")
 
-# 設定 Logger
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 控制同一個 Session 的併發寫入
+SESSION_LOCKS = {}
 
 # ==========================================
-# 定義 Graph 狀態 (State)
-# 流動在各個節點之間的資料結構
+# Schema 定義
+# ==========================================
+class RouteQuery(BaseModel):
+    intent: Literal["direct_answer", "vector_search"] = Field(
+        description="Choose 'direct_answer' for greetings, casual chat, or questions about your identity. Choose 'vector_search' for specific facts or requiring external context."
+    )
+
+class ContextGrade(BaseModel):
+    is_relevant: bool = Field(
+        description="True if the context provides useful facts for ANY PART of the query."
+    )
+
+class CompletenessCheck(BaseModel):
+    is_complete: bool = Field(
+        description="True if the provided documents can FULLY answer the user's query."
+    )
+    missing_query: str = Field(
+        description="If is_complete is False, provide a targeted search query to find the missing information on the web. If True, leave empty."
+    )
+
+# ==========================================
+# Graph 狀態定義
 # ==========================================
 class GraphState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     question: str
-    search_query: str
     session_id: str
-    documents: List[dict]      # 存放找到的文件片段
-    sources: Set[str]         # 存放資料來源
+    documents: List[dict]           
+    web_search_needed: bool         
+    web_search_query: str           
 
-
+# ==========================================
+# Adaptive RAG Service
+# ==========================================
 class RAGService:
     def __init__(self):
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model=settings.EMBEDDING_MODEL,
-            google_api_key=settings.GOOGLE_API_KEY
-        )
-
-        self.llm = ChatGoogleGenerativeAI(
-            model=settings.LLM_MODEL,
-            google_api_key=settings.GOOGLE_API_KEY,
-            temperature=0.2 # 溫度調低
-        )
-        
+        logger.info("[System] Initializing RAGService components...")
+        self.embeddings = GoogleGenerativeAIEmbeddings(model=settings.EMBEDDING_MODEL, google_api_key=settings.GOOGLE_API_KEY)
+        self.llm = ChatGoogleGenerativeAI(model=settings.LLM_MODEL, google_api_key=settings.GOOGLE_API_KEY, temperature=0.1, streaming=True)
         self.tavily_client = AsyncTavilyClient(api_key=settings.TAVILY_API_KEY)
         
-        # 初始化 BGE Reranker 模型
-        logger.info("載入 BGE Reranker 模型")
+        self.qdrant_client = QdrantClient(url=settings.QDRANT_URL)
+        self.sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
         self.cross_encoder_model = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
-        # 設定保留分數最高的 Top 8
-        self.compressor = CrossEncoderReranker(model=self.cross_encoder_model, top_n=8)
-        logger.info("Reranker 模型載入完成！")
         
-        # === 建立 LangGraph 狀態機 ===
         self.graph = self._build_graph()
-        logger.info("LangGraph State Machine initialized.")
+        logger.info("[System] RAGService initialization completed successfully.")
 
-    # ==========================================
-    # 定義各個節點 (Nodes) 邏輯
-    # ==========================================
-    
-    async def rewrite_node(self, state: GraphState):
-        """節點：查詢重寫 (Query Rewrite)"""
-        original_question = state["question"]
+    # ------------------------------------------
+    # 意圖路由 (Query Router)
+    # ------------------------------------------
+    async def analyze_intent(self, state: GraphState) -> str:
+        session_id = state.get("session_id", "unknown")
+        logger.info(f"[Router] Analyzing query intent. (Session: {session_id})")
         
-        logger.info(f"[Rewrite Node] Original Question: {original_question}")
+        prompt = ChatPromptTemplate.from_template(
+            "Route the user's query to either 'direct_answer' (greetings, general knowledge) or 'vector_search' (requires specific data/facts).\nQuestion: {question}"
+        )
+        chain = prompt | self.llm.with_structured_output(RouteQuery)
+        try:
+            res = await chain.ainvoke({"question": state["question"]})
+            logger.info(f"[Router] Intent resolved: '{res.intent}' (Session: {session_id})")
+            return res.intent
+        except Exception as e:
+            logger.warning(f"[Router] Intent parsing failed: {str(e)}. Defaulting to 'vector_search'. (Session: {session_id})")
+            return "vector_search"
 
-        # 使用 LLM 將使用者的問題轉換為最佳的向量檢索關鍵字
+    async def direct_answer_node(self, state: GraphState, config: RunnableConfig):
+        session_id = state.get("session_id", "unknown")
+        logger.info(f"[Node: DirectAnswer] Executing direct response. (Session: {session_id})")
+        
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a Search Query Optimization Expert.
-            Convert the user's conversational question into a CONCISE and highly effective search query.
-            
-            CRITICAL RULES:
-            1. KEEP IT SHORT: Use ideally 3 to 6 words.
-            2. ESSENTIALS ONLY: Extract ONLY the core entities, exact dates, and main metrics.
-            3. NO FILLERS: Do NOT add descriptive filler words or synonyms like "comparison", "analysis", "performance", "what is", or "tell me".
-            4. Translate to English for better search results.
-            
-            Return ONLY the string.
-            """),
+            ("system", "You are a helpful AI assistant. Answer directly and naturally."),
             ("human", "{question}")
         ])
+        response = await (prompt | self.llm).ainvoke({"question": state["question"]}, config=config)
+        return {"messages": [response]}
 
-        # 使用 StrOutputParser 確保只拿回純文字
-        chain = prompt | self.llm | StrOutputParser()
-        optimized_query = await chain.ainvoke({"question": original_question})
-        
-        logger.info(f"[Rewrite Node] Optimized Query: {optimized_query}")
-        
-        # 將重寫後的查詢存入 state
-        return {"search_query": optimized_query}
-    
-    async def retrieve_node(self, state: GraphState):
-        """節點：查詢本地 Qdrant 向量庫並 rerank"""
-        
-        # 確保查詢字串絕對乾淨，去除多餘空白與換行
-        search_target = state.get("search_query", state["question"])
-        if isinstance(search_target, str):
-            search_target = search_target.strip()
-        
-        # 如果重寫後的字串為空，強制退回使用者的原始提問
-        if not search_target:
-            search_target = state["question"].strip()
-            logger.warning("[Retrieve Node] search_query was empty, fallback to original question.")
-            
-        session_id = state["session_id"]
+    # ------------------------------------------
+    # 檢索、相關性評估與完整性檢查 (Retrieval & Grader)
+    # ------------------------------------------
+    async def retrieve_and_grade_node(self, state: GraphState):
+        session_id = state.get("session_id", "unknown")
+        question = state["question"]
         collection_name = f"session_{session_id}"
         
-        docs = []
-        sources = state.get("sources", set())
-
-        try:
-            client = QdrantClient(url=settings.QDRANT_URL)
-            collections = client.get_collections().collections
-            
-            if any(c.name == collection_name for c in collections) and client.count(collection_name).count > 0:
-                vector_store = QdrantVectorStore(client=client, collection_name=collection_name, embedding=self.embeddings)
-                
-                # First-stage Retrieval -> 撈出 25 筆
-                base_retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 25})
-                
-                # 取得初始文件
-                retrieved_docs = await base_retriever.ainvoke(search_target)
-                
-                # 有找到文件，再手動丟給 Reranker 進行重新評分與篩選 Top 8
-                if retrieved_docs:
-                    # 使用 acompress_documents 確保完全非同步，不卡死主執行緒
-                    retrieved_docs = await self.compressor.acompress_documents(retrieved_docs, search_target)
-                
-                for d in retrieved_docs:
-                    source_name = d.metadata.get("source", "unknown")
-                    docs.append({
-                        "source_name": source_name,
-                        "url": None,
-                        "content": d.page_content
-                    })
-                    sources.add(source_name)
-                    
-            logger.info(f"[Retrieve Node] Successfully retrieved and reranked {len(docs)} document chunks.")
-        except Exception as e:
-            logger.warning(f"[Retrieve Node] Error: {e}")
-
-        return {"documents": docs, "sources": sources}
-
-    async def grade_and_route(self, state: GraphState) -> str:
-        """條件邊界 (Conditional Edge)：評估文件是否足夠回答問題"""
-        question = state["question"]
-        documents = state.get("documents", [])
-
-        # 如果根本沒找到文件，直接去上網查
-        if not documents:
-            logger.info("[Grader] No documents found. Routing to -> Web Search.")
-            return "web_search"
-
-        # 使用 LLM 來當裁判 (Grader)
-        context = "\n\n".join([doc["content"] for doc in documents])
-        prompt = ChatPromptTemplate.from_template(
-            """You are a grader assessing whether the following retrieved context is sufficient to fully answer the user's question.
-            
-            Context:
-            {context}
-            
-            User Question:
-            {question}
-            
-            If the context contains enough information to answer the question, output exactly "yes".
-            If the context is missing information (e.g., asking for comparison but only one entity is found), output exactly "no".
-            Do not provide any other text.
-            """
-        )
+        logger.info(f"[Node: Retriever] Initiating hybrid retrieval pipeline. (Session: {session_id})")
         
-        chain = prompt | self.llm | StrOutputParser()
-        score = await chain.ainvoke({"context": context, "question": question})
-        score = score.strip().lower()
+        collections = [c.name for c in self.qdrant_client.get_collections().collections]
+        if collection_name not in collections:
+            logger.warning(f"[Retriever] Collection '{collection_name}' not found. Flagging for Web Search fallback. (Session: {session_id})")
+            return {"documents":[], "web_search_needed": True, "web_search_query": question}
 
-        if "yes" in score:
-            logger.info("[Grader] Context is sufficient. Routing to -> Generate.")
-            return "generate"
-        else:
-            logger.info("[Grader] Context is insufficient. Routing to -> Web Search.")
-            return "web_search"
+        # 混合檢索 (Hybrid Search)
+        retriever = QdrantVectorStore(
+            client=self.qdrant_client, collection_name=collection_name, 
+            embedding=self.embeddings, sparse_embedding=self.sparse_embeddings,
+            retrieval_mode=RetrievalMode.HYBRID
+        ).as_retriever(search_kwargs={"k": 10})
+        
+        fetched_docs = await retriever.ainvoke(question)
+        logger.info(f"[Retriever] Fetched {len(fetched_docs)} raw documents from vector store. (Session: {session_id})")
+        
+        if not fetched_docs:
+            logger.info(f"[Retriever] No documents retrieved. Flagging for Web Search fallback. (Session: {session_id})")
+            return {"documents":[], "web_search_needed": True, "web_search_query": question}
 
+        # 重排序 (Reranker)
+        pairs = [[question, doc.page_content] for doc in fetched_docs]
+        scores = await asyncio.to_thread(self.cross_encoder_model.score, pairs)
+        candidates = [doc for doc, score in zip(fetched_docs, scores) if float(score) > 0]
+        logger.info(f"[Reranker] {len(candidates)} documents passed the cross-encoder threshold. (Session: {session_id})")
+
+        # 文件評分器
+        async def grade_doc(doc):
+            prompt = ChatPromptTemplate.from_template(
+    """You are a highly strict document evaluator. 
+    Your task is to determine if the provided context contains specific, useful information that directly answers ANY PART of the user's query.
+    
+    CRITICAL EVALUATION RULES:
+    1. PARTIAL OR FULL ENTITY MATCH: The context MUST explicitly discuss AT LEAST ONE of the core entities or subjects mentioned in the query. 
+       **IMPORTANT**: If the user's query involves multiple entities, subjects, or a comparison between them, a document that contains substantive facts about JUST ONE of those entities is STILL HIGHLY RELEVANT. You must answer True in this case.
+    2. NO KEYWORD ILLUSION: Do NOT answer True just because the context shares generic keywords (e.g., dates, years, locations, industry terms) but discusses a completely different subject.
+    3. SUBSTANTIVE CONTENT: If the core entity is only mentioned in passing (e.g., in a list of partners or a disclaimer) without providing relevant facts to answer the query, answer False.
+    
+    Return True ONLY if the context is demonstrably useful for answering at least a part of the query. Otherwise, return False.
+    
+    Query: {question}
+    Context: {context}"""
+)
+            try:
+                res = await (prompt | self.llm.with_structured_output(ContextGrade)).ainvoke({
+                    "question": question, "context": doc.page_content
+                })
+                return doc if res.is_relevant else None
+            except Exception as e:
+                logger.debug(f"[Grader] Error grading document: {e}")
+                return None 
+
+        results = await asyncio.gather(*(grade_doc(d) for d in candidates[:5]))
+        valid_docs = [{"content": d.page_content, "source": d.metadata.get("source", "Local Document")} for d in results if d]
+        logger.info(f"[Grader] {len(valid_docs)} documents evaluated as highly relevant. (Session: {session_id})")
+
+        # 完整性檢查器 (Completeness Check)
+        if not valid_docs:
+            logger.info(f"[Grader] Zero relevant local documents found. Triggering Web Search. (Session: {session_id})")
+            return {"documents":[], "web_search_needed": True, "web_search_query": question}
+
+        context_str = "\n".join([d["content"] for d in valid_docs])
+        prompt_complete = ChatPromptTemplate.from_template("""
+        You are an AI data completeness checker.
+        Your task is to determine if the provided context FULLY answers every aspect of the user's query.
+        
+        CRITICAL RULE FOR MULTI-SUBJECT QUERIES:
+        If the query asks about multiple distinct subjects, entities, or concepts, the context MUST provide sufficient information for ALL of them to be considered complete. If the context only covers a subset of the requested subjects (e.g., providing data for Entity A but missing Entity B), then it is NOT complete, and you must generate a missing query to search for the absent information.
+        
+        Query: {question}
+        Context: {context}
+        """)
+        
+        try:
+            check_res = await (prompt_complete | self.llm.with_structured_output(CompletenessCheck)).ainvoke({
+                "question": question, "context": context_str
+            })
+            needs_web = not check_res.is_complete
+            web_query = check_res.missing_query if needs_web else question
+            logger.info(f"[Grader] Completeness check resolved. is_complete={check_res.is_complete}. (Session: {session_id})")
+        except Exception as e:
+            logger.warning(f"[Grader] Completeness check failed: {e}. Defaulting to no web search. (Session: {session_id})")
+            needs_web = False
+            web_query = question
+
+        if needs_web:
+            logger.info(f"[Grader] Formulated missing information query for Web Search: '{web_query}' (Session: {session_id})")
+
+        return {
+            "documents": valid_docs, 
+            "web_search_needed": needs_web,
+            "web_search_query": web_query
+        }
+
+    def route_to_web_search_or_generate(self, state: GraphState) -> str:
+        """根據狀態決定是否觸發網路搜尋"""
+        decision = "web_search" if state.get("web_search_needed") else "generate"
+        logger.info(f"[Graph Router] Node routing decision: '{decision}'. (Session: {state.get('session_id')})")
+        return decision
+
+    # ------------------------------------------
+    # 網路搜尋 (Web Search)
+    # ------------------------------------------
     async def web_search_node(self, state: GraphState):
-        """節點：聯網搜尋 (Tavily AI Search)"""
-        search_target = state.get("search_query", state["question"])
-        documents = state.get("documents", [])
-        sources = state.get("sources", set())
-
-        logger.info(f"[Web Search Node] Searching Tavily for: {search_target}")
+        session_id = state.get("session_id", "unknown")
+        search_query = state.get("web_search_query", state["question"])
+        docs = state.get("documents", []) 
+        
+        logger.info(f"[Node: WebSearch] Executing external search for query: '{search_query}'. (Session: {session_id})")
         
         try:
-            # 呼叫 Tavily API
-            # search_depth="basic" 速度極快且夠用，"advanced" 則會深入爬取長文
-            response = await self.tavily_client.search(
-                query=search_target,
-                max_results=5,          # 抓取前 5 筆最相關的資料
-                search_depth="basic" 
-            )
+            search_results = await self.tavily_client.search(query=search_query, max_results=3)
+            found_results = search_results.get("results", [])
+            logger.info(f"[WebSearch] Successfully retrieved {len(found_results)} web results. (Session: {session_id})")
             
-            # Tavily 的結果
-            search_results = response.get("results", [])
-            
-            if search_results:
-                for res in search_results:
-                    title = res.get("title", "Internet Search")
-                    link = res.get("url", "")
-                    content = res.get("content", "")
-                    
-                    documents.append({
-                        "source_name": title,
-                        "url": link,
-                        "content": content
-                    })
-                    sources.add(title)
-                    
-                logger.info(f"[Web Search Node] Successfully retrieved {len(search_results)} results from Tavily.")
-            else:
-                logger.warning("[Web Search Node] Tavily returned empty results.")
-                
+            for res in found_results:
+                docs.append({
+                    "content": res.get("content", ""),
+                    "source": res.get("url", "Web Search")
+                })
         except Exception as e:
-            logger.error(f"[Web Search Node] Tavily Search failed: {e}")
-
-        return {"documents": documents, "sources": sources}
-
-    async def generate_node(self, state: GraphState, config: RunnableConfig):
-        """節點：結合所有收集到的資料，生成最終回答"""
-        question = state["question"]
-        documents = state.get("documents", [])
-
-        grouped_docs = {}
-        for doc in documents:
-            key = (doc["source_name"], doc["url"])
-            if key not in grouped_docs:
-                grouped_docs[key] = []
-            grouped_docs[key].append(doc["content"])
-
-        context = ""
-        for i, (key, contents) in enumerate(grouped_docs.items(), 1):
-            source_name, url = key
-            context += f"=== Source [{i}] ===\n"
-            context += f"Name: {source_name}\n"
-            if url:
-                context += f"URL: {url}\n"
-            context += "Content:\n" + "\n...\n".join(contents) + "\n\n"
+            logger.error(f"[WebSearch] Tavily search API failed: {e}. Proceeding with existing local context.", exc_info=True)
             
-        if not context:
-            context = "No relevant context found."
+        return {"documents": docs}
+
+    # ------------------------------------------
+    # 生成與防幻覺 (Generate & Anti-Hallucination)
+    # ------------------------------------------
+    async def generate_node(self, state: GraphState, config: RunnableConfig):
+        session_id = state.get("session_id", "unknown")
+        docs = state.get("documents", [])
+        logger.info(f"[Node: Generator] Synthesizing final response utilizing {len(docs)} document chunks. (Session: {session_id})")
+        
+        # 建立獨立的來源 ID 映射表
+        source_map = {}
+        current_id = 1
+        for d in docs:
+            src = d['source']
+            if src not in source_map:
+                source_map[src] = current_id
+                current_id += 1
+                
+        # 建立帶有 [ID] 標記的 Context 字串
+        context_parts = []
+        for d in docs:
+            src_id = source_map[d['source']]
+            context_parts.append(f"[{src_id}] Source: {d['source']}\nContent: {d['content']}")
+        context_str = "\n\n".join(context_parts)
         
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a highly intelligent Information Synthesis Agent.
+            ("system", """You are a highly intelligent and structured Assistant. 
             
-            === GATHERED CONTEXT ===
+            === GATHERED EVIDENCE ===
             {context}
-            ========================
+            =========================
             
-            CRITICAL INSTRUCTIONS (MUST FOLLOW EXACTLY OR FAIL):
-            1. DIRECT ANSWER: Start IMMEDIATELY with the facts. No filler phrases.
-            2. SEQUENTIAL RENUMBERING (CRITICAL): You MUST renumber the sources you actually cite sequentially, starting from 1 (i.e., 1, 2, 3...). Do NOT skip numbers. Ignore the original Source IDs from the context.
-            3. INLINE CITATIONS (MUST BE CLICKABLE): 
-               - For internet sources, you MUST embed the URL inline using this EXACT format: `[[1](URL)]` (Outer brackets are plain text, the number inside is a clickable link).
-               - For local documents, use plain text: `[1]`
-               - NEVER combine citations. Use `[1][[2](URL)]`, NOT `[1, 2]`.
-            4. SOURCES LIST FORMAT (CRITICAL): At the VERY END, add a blank line, write exactly "**Sources:**" (in bold), and list EACH cited source sequentially.
-               - Use a standard numbered list (`1. `, `2. `, `3. `). Do NOT use bullet points (`-`).
-               - Format for internet sources: `1. [Name](URL)`
-               - Format for local documents: `1. Name`
-               
-               Example Footer:
-               
-               **Sources:**
-               1. NVIDIA_FY25_Q3.pdf
-               2. [AMD Earnings Report](https://example.com)
-               3. [Tech News](https://news.com)
+            CRITICAL INSTRUCTIONS (FORMAT & ANTI-HALLUCINATION):
+            1. Answer the question using ONLY the provided evidence. If you don't know, say "I cannot answer this based on the provided sources."
+            2. STRUCTURE: Use Markdown formatting. Use headers (###) and bullet points to organize the information clearly. 
+                - If comparing multiple subjects, create a section for each subject.
+                - End with a '綜合比較總結' (Summary) section if applicable.
+            3. INLINE CITATIONS & DYNAMIC RENUMBERING (CRITICAL): 
+                - You MUST append citations at the end of every sentence or bullet point that uses evidence.
+                - **RENUMBERING RULE:** You must dynamically renumber the citations in your final output so they are strictly sequential (i.e., `[1]`, `[2]`, `[3]`, `[4]`). Do NOT skip numbers, even if the original [ID] in the Gathered Evidence skipped.
+                - For internet sources, you MUST use valid Markdown link syntax where the citation number is the clickable text. Format: `[[1]](URL)` (e.g., `[[2]](https://example.com)`).
+                - For local documents, use plain text: `[1]`.
+            4. FOOTER (SOURCES LIST):
+                - At the very end of your response, add a blank line, type "**Sources:**".
+                - DO NOT write them on a single line.
+                - Example Format:
+                **Sources:**
+                1. EXAMPLE.pdf
+                2. [Example Web Source](https://example.com)
             """),
             ("human", "{question}")
         ])
 
-        chain = prompt | self.llm
-        
-        response_message = await chain.ainvoke(
-            {"context": context, "question": question},
-            config=config 
+        response = await (prompt | self.llm).ainvoke(
+            {"context": context_str, "question": state["question"]}, config=config
         )
+        logger.info(f"[Generator] Response synthesis completed successfully. (Session: {session_id})")
+        return {"messages": [response]}
 
-        logger.info("[Generate Node] Answer generated.")
-        return {"messages": [response_message]}
-
-    # ==========================================
-    # 組裝 Graph (連接節點與邊界)
-    # ==========================================
+    # ------------------------------------------
+    # LangGraph 狀態機組裝
+    # ------------------------------------------
     def _build_graph(self):
         workflow = StateGraph(GraphState)
-
-        # 加入所有節點
-        workflow.add_node("rewrite", self.rewrite_node)
-        workflow.add_node("retrieve", self.retrieve_node)
+        
+        workflow.add_node("direct_answer", self.direct_answer_node)
+        workflow.add_node("retrieve_and_grade", self.retrieve_and_grade_node)
         workflow.add_node("web_search", self.web_search_node)
         workflow.add_node("generate", self.generate_node)
         
-        # 設定流程起點 -> 先去重寫問題
-        workflow.add_edge(START, "rewrite")         
-        
-        # 重寫完畢 -> 去檢索
-        workflow.add_edge("rewrite", "retrieve")    
-
-        # 設定條件分歧點 -> 檢索完後交給 Grader 決定下一步
+        # 起點路由 (Router)
         workflow.add_conditional_edges(
-            "retrieve",
-            self.grade_and_route,
-            {
-                "web_search": "web_search", # 如果回傳 web_search，走向聯網
-                "generate": "generate"      # 如果回傳 generate，直接走向生成
-            }
+            START, 
+            self.analyze_intent, 
+            {"direct_answer": "direct_answer", "vector_search": "retrieve_and_grade"}
         )
-        # 聯網搜尋完畢後 -> 生成
-        workflow.add_edge("web_search", "generate")
-        # 生成完畢後 -> 結束
-        workflow.add_edge("generate", END)
+        workflow.add_edge("direct_answer", END)
 
+        # 相關性評估與分支 (Grader -> Web Search / Generate)
+        workflow.add_conditional_edges(
+            "retrieve_and_grade", 
+            self.route_to_web_search_or_generate, 
+            {"web_search": "web_search", "generate": "generate"}
+        )
+        
+        workflow.add_edge("web_search", "generate")
+        workflow.add_edge("generate", END)
+        
         return workflow.compile()
 
-    # ==========================================
-    # 對外接口
-    # ==========================================
-    
+    # ------------------------------------------
+    # 入向量資料庫 Pipeline (解析 -> 切塊 -> 向量化)
+    # ------------------------------------------
     async def process_and_index_document(self, file: UploadFile, session_id: str):
         collection_name = f"session_{session_id}"
-        temp_file_path = None
+        temp_path = None
+        
+        logger.info(f"[Indexer] Starting ingestion pipeline for file: '{file.filename}'. (Session: {session_id})")
+        
+        if session_id not in SESSION_LOCKS:
+            SESSION_LOCKS[session_id] = asyncio.Lock()
+            
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
                 shutil.copyfileobj(file.file, tmp)
-                temp_file_path = tmp.name
-            parser = LlamaParse(api_key=settings.LLAMA_CLOUD_API_KEY, result_type="markdown", verbose=True)
-            job_result = await parser.aparse(temp_file_path)
-            langchain_docs = [Document(page_content=page.text, metadata={"source": file.filename}) for page in job_result.pages]
-            QdrantVectorStore.from_documents(documents=langchain_docs, embedding=self.embeddings, url=settings.QDRANT_URL, collection_name=collection_name, force_recreate=False)
-            return {"status": "success", "chunks": len(langchain_docs), "collection": collection_name}
+                temp_path = tmp.name
+                
+            logger.info(f"[Indexer] Extracted file to temporary path. Initiating LlamaParse... (Session: {session_id})")
+            
+            # LlamaParse 解析
+            parser = LlamaParse(api_key=settings.LLAMA_CLOUD_API_KEY, result_type="markdown")
+            job_result = await parser.aparse(temp_path)
+            full_md_text = "\n\n".join([p.text for p in job_result.pages])
+            logger.info(f"[Indexer] LlamaParse successfully parsed {len(job_result.pages)} pages. (Session: {session_id})")
+
+            # 語意切塊
+            md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "H1"), ("##", "H2"), ("###", "H3")])
+            md_docs = md_splitter.split_text(full_md_text)
+            final_chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(md_docs)
+
+            for chunk in final_chunks:
+                chunk.metadata["source"] = file.filename
+                
+            logger.info(f"[Indexer] Text splitting complete. Generated {len(final_chunks)} distinct chunks. (Session: {session_id})")
+
+            # 確保同一個 Session 一次只有一個檔案在處理 Qdrant 操作
+            async with SESSION_LOCKS[session_id]:
+                logger.info(f"[Indexer] Acquired Qdrant lock for ingestion. (Session: {session_id})")
+                collection_exists = self.qdrant_client.collection_exists(collection_name)
+
+                if not collection_exists:
+                    logger.info(f"[Indexer] Collection '{collection_name}' not found. Initializing new collection and inserting vectors...")
+                    await QdrantVectorStore.afrom_documents(
+                        documents=final_chunks,
+                        embedding=self.embeddings,
+                        sparse_embedding=self.sparse_embeddings,
+                        collection_name=collection_name,
+                        url=settings.QDRANT_URL, 
+                        retrieval_mode=RetrievalMode.HYBRID
+                    )
+                else:
+                    logger.info(f"[Indexer] Collection '{collection_name}' exists. Appending new vectors...")
+                    store = QdrantVectorStore(
+                        client=self.qdrant_client,
+                        collection_name=collection_name,
+                        embedding=self.embeddings, 
+                        sparse_embedding=self.sparse_embeddings,
+                        retrieval_mode=RetrievalMode.HYBRID
+                    )
+                    await store.aadd_documents(final_chunks)
+
+            logger.info(f"[Indexer] Ingestion pipeline successfully completed for '{file.filename}'. (Session: {session_id})")
+            return {"status": "success", "chunks_indexed": len(final_chunks)}
+            
         except Exception as e:
-            logger.error(f"Index Error: {e}")
+            logger.error(f"[Indexer] Fatal error during document processing for '{file.filename}': {str(e)}", exc_info=True)
             raise e
         finally:
-            if temp_file_path and os.path.exists(temp_file_path): os.remove(temp_file_path)
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                    logger.debug(f"[Indexer] Cleanup successful. Removed temporary file: {temp_path}")
+                except Exception as cleanup_error:
+                    logger.warning(f"[Indexer] Cleanup failed for temporary file {temp_path}: {cleanup_error}")
 
-    async def query_document(self, question: str, session_id: str):
-        """給 extraction_service 用的非串流版本，直接呼叫 Graph"""
-        inputs = {
-            "question": question,
-            "session_id": session_id,
-            "messages": [HumanMessage(content=question)],
-            "documents": [],
-            "sources": set()
-        }
-        result = await self.graph.ainvoke(inputs)
-        return {
-            "answer": result["messages"][-1].content,
-            "source_documents": list(result.get("sources", set()))
-        }
-
+    # ------------------------------------------
+    # API 呼叫：流式輸出
+    # ------------------------------------------
     async def stream_query(self, question: str, session_id: str) -> AsyncGenerator[str, None]:
-        """
-        [Streaming] 整合自訂的 State Machine 進行串流 
-        """
+        logger.info(f"[Stream API] Initializing query stream. (Session: {session_id}) | Question: '{question}'")
+        
         inputs = {
-            "question": question,
+            "question": question, 
             "session_id": session_id,
             "messages": [HumanMessage(content=question)],
-            "documents": [],
-            "sources": set()
+            "documents": [], 
+            "web_search_needed": False,
+            "web_search_query": ""
         }
 
         try:
-            logger.info(f"Starting Control-Flow Stream for: {question}")
-            
-            # 用來在串流過程中收集來源
-            collected_sources = set()
-            # 用來收集 LLM 的完整回答
-            full_generated_text = ""
-            
-            # 使用 config 傳遞串流設定 (給 generate_node 裡的 LLM 用)
-            config = RunnableConfig()
-
-            async for stream_mode, chunk in self.graph.astream(inputs, stream_mode=["messages", "updates"], config=config):
+            async for mode, chunk in self.graph.astream(inputs, stream_mode=["messages", "updates"], config=RunnableConfig()):
+                if mode == "updates":
+                    for n, state in chunk.items():
+                        if n == "retrieve_and_grade" and state.get("web_search_needed"):
+                            search_target = state.get("web_search_query", question)
+                            yield json.dumps({"type": "status", "content": f"觸發網路搜尋以補齊資訊：{search_target}..."}) + "\n"
                 
-                # A. 處理節點狀態更新 (攔截 Sources 與 Status)
-                if stream_mode == "updates":
-                    for node_name, node_state in chunk.items():
-                        
-                        # 1. 攔截 sources 
-                        if "sources" in node_state:
-                            collected_sources.update(node_state["sources"])
-
-                        # 2. 攔截 web_search 狀態
-                        if node_name == "web_search":
-                            yield json.dumps({"type": "status", "content": "🔍 Context insufficient. Searching the web..."}) + "\n"
-                
-                # B. 處理文字串流 (只抓取 generate 節點產生的 LLM token)
-                elif stream_mode == "messages":
-                    msg, metadata = chunk
-                    if metadata.get("langgraph_node") == "generate":
-                        if isinstance(msg, BaseMessage) and msg.content:
-                            content_str = ""
-                            if isinstance(msg.content, str):
-                                content_str = msg.content
-                            elif isinstance(msg.content, list):
-                                for item in msg.content:
-                                    if isinstance(item, str): content_str += item
-                                    elif isinstance(item, dict) and 'text' in item: content_str += item['text']
-                            
+                elif mode == "messages":
+                    msg, meta = chunk
+                    if meta.get("langgraph_node") in ["generate", "direct_answer"]:
+                        if isinstance(msg, AIMessageChunk) and msg.content:
+                            content_str = msg.content if isinstance(msg.content, str) else "".join([i.get("text", "") for i in msg.content])
                             if content_str:
                                 yield json.dumps({"type": "token", "content": content_str}) + "\n"
-
-            # LLM 已經把 Reference 寫在 markdown 裡了
-            yield json.dumps({"type": "sources", "content": []}) + "\n"
-
+                                
+            logger.info(f"[Stream API] Query stream successfully concluded. (Session: {session_id})")
+            
         except Exception as e:
-            logger.error(f"Stream Error: {e}", exc_info=True)
+            logger.error(f"[Stream API] Encountered exception during streaming: {str(e)} (Session: {session_id})", exc_info=True)
             yield json.dumps({"type": "error", "content": str(e)}) + "\n"
 
+# 初始化實體
 rag_service = RAGService()
